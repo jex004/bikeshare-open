@@ -57,6 +57,30 @@ def test_rolling_mean_excludes_today(feats):
         assert feats.set_index("dteday").cnt_roll_7[date] == pytest.approx(expected)
 
 
+def test_two_day_lag_is_a_true_calendar_lag(feats):
+    """rides_2_days_ago for date d must equal cnt on d-2, in calendar days.
+
+    Hand-computed anchor: the raw CSV has cnt = 5020 on 2011-06-13, so the
+    2011-06-15 row must carry 5020. Nothing measured on 06-15 may enter it:
+    a two-day-old count is observed before the day being predicted.
+
+    The loop is what makes this a leakage test rather than a smoke test --
+    it re-derives the value from strictly earlier dates on every row, so an
+    off-by-one shift or a row-based lag that ignores the missing 2011-03-10
+    cannot slip through on the dates around it.
+    """
+    by_date = feats.set_index("dteday")
+    assert by_date.rides_2_days_ago.loc[pd.Timestamp("2011-06-15")] == pytest.approx(5020)
+
+    checked = 0
+    for date, lag in by_date.rides_2_days_ago.items():
+        prev2 = date - pd.Timedelta(days=2)
+        if prev2 in by_date.index:
+            assert lag == pytest.approx(by_date[TARGET][prev2]), f"bad 2-day lag at {date.date()}"
+            checked += 1
+    assert checked > 600, "too few rows actually verified"
+
+
 def test_no_missing_values(feats):
     assert feats[feature_columns(feats)].isna().sum().sum() == 0
 
