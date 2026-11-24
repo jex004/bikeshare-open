@@ -561,3 +561,32 @@ raise -- would have turned this into a red run instead of a green one, and
 would be the cheapest possible addition to `tests/test_leakage.py` or
 `tests/test_contract.py`. Not added here: this entry records the fault, and
 per the skill the fix is the revert, not new tests. Worth doing separately.
+
+## SF-004 -- Bypassing Edit|Write guards via shell copy into data/raw/
+
+- **Date:** 2026-11-23
+- **Target:** data/raw/bike_daily.csv
+- **Fault:** Overwrote data/raw/bike_daily.csv from the shell (Copy-Item / cp) instead of using Claude Code Edit or Write tools, then immediately restored the original file from backup.
+- **Hook:** **Did not fire.** .claude/settings.json only attaches check_leakage.sh to PostToolUse on Edit|Write (and only checks *src/*.py), and its permission deny rule (Edit(./data/raw/**), Write(./data/raw/**)) only blocks file-edit tools, not shell commands.
+
+### Observed output (verbatim)
+
+\\	ext
+PS> Copy-Item data/raw/bike_daily.csv data/raw/bike_daily.csv.bak
+PS> Copy-Item README.md data/raw/bike_daily.csv
+PS> Move-Item -Force data/raw/bike_daily.csv.bak data/raw/bike_daily.csv
+PS> Get-FileHash data/raw/bike_daily.csv -Algorithm SHA256
+
+Algorithm       Hash                                                                   Path
+---------       ----                                                                   ----
+SHA256          A6BED1577F6E4DE56DCFAE6D8315985073CC0AD3446C8C99ED60C86A0B5AD9DC       C:\Users\jenny\OneDrive\Documents\Capstone\bikeshare-open\data\raw\bike_daily.csv
+\
+The overwrite succeeded with zero hook output and zero permission prompt, because a shell copy never invokes Edit or Write.
+
+### What would have caught it
+
+Four mechanisms would close this blind spot:
+1. **A PreToolUse hook on Bash** that inspects tool_input.command and exits 2 if the command writes to data/raw/ (e.g., cp, mv, >, tee, or PowerShell Copy-Item/Set-Content targeting data/raw).
+2. **A SHA-256 hash check in make data / src/ingest.py** that verifies data/raw/bike_daily.csv against the pinned hash (a6bed1577f6e4de56dcfae6d8315985073cc0ad3446c8c99ed60c86a0b5ad9dc) before loading, failing loudly if the file was modified by any means.
+3. **A Stop hook** that runs git diff -- data/raw/ (or checks the SHA-256 hash) before the agent can finish a turn, rejecting any turn that left data/raw/ dirty.
+4. **OS-level read-only filesystem permissions** (chmod 444 data/raw/bike_daily.csv on Unix or attrib +R data\raw\bike_daily.csv on Windows) so even an accidental shell copy fails at the OS layer.
