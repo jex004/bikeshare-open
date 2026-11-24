@@ -406,3 +406,158 @@ repo has a leakage detector that only `make test` -- a command an agent must
 choose to run -- ever reaches, and the hook contributes nothing. The next
 `/seed-fault` run in a fresh session is the cheapest way to test the
 "config written mid-session" hypothesis above.
+
+## SF-003 -- `encode_weather()` loses its loud failure on unmapped labels
+
+- **Date:** 2026-11-23
+- **Baseline:** `make test` green at `154f731`, 16 passed
+- **Target:** `src/features.py`
+- **Fault:** The `ValueError` guard in `encode_weather()` was removed, so an
+  unexpected `weather` label silently becomes `NaN` via `.map()` and is then
+  deleted by `dropna()` with no error and no warning.
+- **Hook:** exit 0, no stderr -- consistent with the documented
+  "fault outside `tests/test_leakage.py`" case, but see "Hook stderr" below:
+  this episode **cannot** distinguish "hook ran and had nothing to report"
+  from "hook never ran."
+- **Suite:** **not caught by `make test`** (16 passed). The guard was
+  documented in a docstring and enforced nowhere.
+- **Fixed in:** 2 tool calls (1 Edit + 1 `make test` green, the latter
+  carrying the `git diff`/`git status` verification)
+
+### Exact diff
+
+```diff
+diff --git a/src/features.py b/src/features.py
+index ee7f6fe..4d831ea 100644
+--- a/src/features.py
++++ b/src/features.py
+@@ -24,10 +24,6 @@ def encode_weather(series: pd.Series) -> pd.Series:
+     days -- the most interesting days in the dataset -- disappear with no
+     error and no warning.
+     """
+-    known = series.dropna()
+-    unknown = set(known.unique()) - set(WEATHER_ORDER)
+-    if unknown:
+-        raise ValueError(f"unmapped weather labels: {sorted(unknown)}")
+     return series.map(WEATHER_ORDER).astype(float)
+```
+
+Four lines, not one. Deleting only the `raise` would have left `known` and
+`unknown` assigned and unused -- dead code that reads like a guard still
+doing something -- so the whole block went. That is the minimal edit that
+produces the fault *and* leaves the file coherent; it is not a one-liner and
+this note is why.
+
+### Hook stderr (verbatim)
+
+```
+hook fired, exit 0, no stderr (fault outside tests/test_leakage.py)
+```
+
+Both the fault `Edit` and the revert `Edit` returned **no hook output at
+all**. The edited path is `src/features.py`, which the hook's `*src/*.py`
+matcher accepts, so the hook would not have taken the quiet `*)` exit on
+path grounds -- it would have run `pytest tests/test_leakage.py -q` and,
+finding 8 passed, exited 0 with nothing on stderr. Silence is therefore the
+*correct* output for this fault.
+
+**But silence is also what SF-002 recorded for a fault that should have been
+red.** From the outside the two are identical: no output. So this episode
+neither confirms nor refutes SF-002's open delivery question, and it was
+never going to -- a fault outside leakage scope cannot distinguish a live
+hook from an absent one. SF-002's suggested test (a `src/`-path fault that
+*is* in leakage scope, in a fresh session) remains the way to settle it.
+`.claude/settings.json` does carry the `PostToolUse`/`Edit|Write` entry, so
+the config is present in this session.
+
+### make test (verbatim, red)
+
+The run that was supposed to be red. It was not. Complete output, nothing
+elided:
+
+```
+python -m pytest tests/ -q
+................                                                         [100%]
+16 passed in 6.30s
+MAKE EXIT=0
+```
+
+**The suite did not catch the fault.** This is the finding, and it is a real
+gap rather than an accident of an insensitive assertion: no test anywhere in
+`tests/` references `encode_weather`, its `ValueError`, or the
+`weather_severity` mapping. `grep -n 'encode_weather|unmapped|weather_severity'
+tests/` returns exactly one hit, and it is a comment in
+`tests/test_contract.py:26` classifying `weather` as "consumed ->
+weather_severity" -- a note about where the column goes, not a test of what
+happens when it goes somewhere unexpected.
+
+Why the fault is latent. The removed guard only fires on a label outside
+`GOOD`/`MISTY`/`BAD`, and the mirror contains none. The faulted code is
+therefore not merely untested, it is *never exercised* on today's data:
+
+```
+=== 1. faulted guard on an unmapped label ===
+[0.0, nan, 2.0]
+```
+
+That single `nan` is the whole failure mode: no exception, and `dropna()`
+will swallow the row later. What the downstream detectors do about it,
+checked on the real data rather than assumed:
+
+```
+=== 2. row-loss bound, today's data ===
+raw=728 feats=714 lost=14 allowed_loss=14
+
+=== 3. same, with ONE unmapped label injected ===
+raw=728 feats=713 lost=15 allowed_loss=14
+row-loss test would fire: True
+```
+
+`test_only_expected_rows_are_dropped` (`tests/test_contract.py`) computes
+`allowed_loss = LAG_WARMUP + LAG_WARMUP * missing_days = 7 + 7*1 = 14`, and
+the actual loss is exactly 14. **Zero slack.** One silently-NaN'd row makes
+it 15 and the test fires.
+
+So the fault is caught indirectly, and only if the data ever contains an
+unmapped label -- which is precisely the condition the removed guard existed
+to announce, and precisely the condition under which nobody is watching for
+it. The guard is a *contract* check ("fail loudly on this input"); the
+row-loss test is a *consequence* check ("you lost more rows than
+arithmetic allows"). They are not substitutes: the consequence check
+reports row loss, not the label that caused it, and it has no margin to
+spare by construction. A feature added later that legitimately costs a
+warm-up row would consume the remaining slack and take this backstop with
+it.
+
+This is the same shape SF-001 praised and SF-002 demonstrated: the tests
+that exist are well aimed at what they cover, and the gap is coverage, not
+sensitivity.
+
+### Fix
+
+Restored the four-line guard verbatim with `Edit` (not `git checkout`, so
+the hook had its chance to go green -- it stayed silent, correctly, for the
+same outside-scope reason). No test was loosened and nothing was added to a
+skip-list. Confirmed:
+
+```
+python -m pytest tests/ -q
+................                                                         [100%]
+16 passed in 6.60s
+MAKE EXIT=0
+```
+
+`git diff -- src/` is empty and `git status --porcelain` is empty. Nothing
+committed.
+
+### Follow-up this exposes
+
+The `encode_weather()` docstring argues, at length and well, that a silent
+`.map()` is how "the 20 BAD-weather days -- the most interesting days in the
+dataset -- disappear with no error and no warning." The guard was written
+because someone thought carefully about that failure mode. **Nothing tests
+that the guard is still there.** A one-line test -- an unmapped label must
+raise -- would have turned this into a red run instead of a green one, and
+would be the cheapest possible addition to `tests/test_leakage.py` or
+`tests/test_contract.py`. Not added here: this entry records the fault, and
+per the skill the fix is the revert, not new tests. Worth doing separately.
