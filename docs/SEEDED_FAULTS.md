@@ -214,3 +214,195 @@ Note also that the hook runs only `tests/test_leakage.py`, so even when
 working it would have shown 1 of the 2 failures above. The second,
 `test_contract.py::test_every_raw_column_is_classified`, is only visible to
 `make test`.
+
+## SF-002 -- `cnt_roll_7` includes today's count
+
+- **Date:** 2026-11-23
+- **Baseline:** `make test` green at `ad632ff`, 16 passed
+- **Target:** `src/features.py`
+- **Fault:** Dropped `.shift(1)` from the `cnt_roll_7` rolling mean, so the
+  7-day window ends on the day being predicted instead of the day before it.
+  Today's `cnt` -- the target -- enters a feature.
+- **Hook:** **no output at all.** This is *not* the documented "fault outside
+  `tests/test_leakage.py`" case: the edited path is `src/features.py`, inside
+  the hook's `*src/*.py` matcher, and the fault is squarely in leakage scope.
+  See "Hook stderr" below -- it is also *not* the SF-001 `python3` bug, which
+  `ad632ff` fixed; the script was verified working today.
+- **Suite:** caught by `make test` (1 failed, 15 passed)
+- **Fixed in:** 3 tool calls (1 Edit + 1 `make test` green + 1 `git diff`/
+  `git status` verification)
+
+### Exact diff
+
+```diff
+diff --git a/src/features.py b/src/features.py
+index ee7f6fe..86901c1 100644
+--- a/src/features.py
++++ b/src/features.py
+@@ -73,7 +73,7 @@ def build_features(df: pd.DataFrame) -> pd.DataFrame:
+     # If you add a longer lag, raise LAG_WARMUP in src/config.py.
+     out["cnt_lag_1"] = out[TARGET].shift(1)
+     out["cnt_lag_7"] = out[TARGET].shift(LAG_WARMUP)
+-    out["cnt_roll_7"] = out[TARGET].shift(1).rolling(LAG_WARMUP).mean()
++    out["cnt_roll_7"] = out[TARGET].rolling(LAG_WARMUP).mean()
+     # Two calendar days back. No aggregation, so no rolling/shift(1) dance:
+     # shift(2) on the reindexed calendar already reads only days <= d-2.
+     # Needs 2 days of history, inside LAG_WARMUP, so the row-loss bound holds.
+```
+
+One line, as asked -- no other change folded in.
+
+### Hook stderr (verbatim)
+
+The `Edit` that applied the fault returned **no hook output at all**. The
+`Edit` that reverted it returned no hook output either. Both edits were to
+`src/features.py`.
+
+This is a *different* failure from SF-001. SF-001's cause was the Microsoft
+Store `python3` alias stub, which `ad632ff` ("Fix check_leakage.sh", 63
+insertions) rewrote away: the hook now probes interpreters by running them
+(`.venv/Scripts/python.exe` first) and calls `fail` instead of exiting 0 when
+it cannot parse its payload. That fix works. Verified by invoking the current
+script by hand with a `src/` payload against the *faulted* tree:
+
+```
+$ printf '%s' '{"tool_name":"Edit","tool_input":{"file_path":"C:/Users/jenny/OneDrive/Documents/Capstone/bikeshare-open/src/features.py"}}' \
+    | CLAUDE_PROJECT_DIR="$PWD" ./.claude/hooks/check_leakage.sh; echo "EXIT=$?"
+Leakage tests failed after editing C:/Users/jenny/OneDrive/Documents/Capstone/bikeshare-open/src/features.py:
+[714 rows x 29 columns]
+
+    def test_rolling_mean_excludes_today(feats):
+        """cnt_roll_7 must be the mean of the 7 calendar days *before* today."""
+        by_date = feats.set_index("dteday")[TARGET]
+        date = feats.dteday.iloc[200]
+        window = [date - pd.Timedelta(days=k) for k in range(1, 8)]
+        if all(d in by_date.index for d in window):
+            expected = sum(by_date[d] for d in window) / 7
+>           assert feats.set_index("dteday").cnt_roll_7[date] == pytest.approx(expected)
+E           assert np.float64(4389.0) == 4414.857142857143 � 0.00441486
+E             
+E             comparison failed
+E             Obtained: 4389.0
+E             Expected: 4414.857142857143 � 0.00441486
+
+tests\test_leakage.py:57: AssertionError
+=========================== short test summary info ============================
+FAILED tests/test_leakage.py::test_rolling_mean_excludes_today - assert np.fl...
+1 failed, 7 passed in 1.18s
+EXIT=2
+```
+
+**This is evidence gathered by hand, not the hook firing on its own** -- same
+distinction SF-001 drew. The script logic is correct and would have reported
+red, exit 2, with exactly this text. It simply did not run as a hook.
+
+What was checked to rule the obvious causes out:
+
+- `.claude/settings.json` is present and well-formed: `PostToolUse`, matcher
+  `Edit|Write`, command `${CLAUDE_PROJECT_DIR}/.claude/hooks/check_leakage.sh`,
+  `timeout: 60`. The matcher covers the tool that made the edit.
+- No hook-disabling setting (`disableAllHooks` or similar) anywhere in
+  `.claude/settings.json`, `.claude/settings.local.json`, or
+  `~/.claude/settings.json`.
+- The script is executable-or-invoked-via-bash correctly; the file is mode
+  `100644` in the index, but the settings entry invokes it through bash, and
+  the manual run above proves invocation succeeds.
+
+**Not determined:** why the harness did not execute it. No hook execution log
+exists under `~/.claude/` (no `*.log`, no debug file), so the evidence cannot
+distinguish "the hook was never invoked this session" from "it was invoked and
+its output was discarded". One unverified lead: both `.claude/settings.json`
+and commit `ad632ff` carry mtime `Nov 23 17:48`, i.e. the hook config may have
+been written in the same minute this session started -- if the session loaded
+its hook config at startup, this session could be running without it. That is
+a hypothesis, not a finding; confirming it needs a fresh session and another
+seeded fault.
+
+The guard rail therefore still does not deliver, for a reason distinct from
+SF-001, and the root cause is open.
+
+### make test (verbatim, red)
+
+Complete output, 25 lines, nothing elided. The `�` in place of `±` is a
+console-encoding artifact from the terminal, reproduced as received rather
+than retyped as `±`.
+
+```
+python -m pytest tests/ -q
+.........F......                                                         [100%]
+================================== FAILURES ===================================
+______________________ test_rolling_mean_excludes_today _______________________
+
+feats =         dteday  instant  season  ...  cnt_lag_7   cnt_roll_7 rides_2_days_ago
+0   2011-01-10     10.0  WINTER  ...    ...          3095.0
+713 2012-12-31    731.0  WINTER  ...      920.0  1789.857143           1341.0
+
+[714 rows x 29 columns]
+
+    def test_rolling_mean_excludes_today(feats):
+        """cnt_roll_7 must be the mean of the 7 calendar days *before* today."""
+        by_date = feats.set_index("dteday")[TARGET]
+        date = feats.dteday.iloc[200]
+        window = [date - pd.Timedelta(days=k) for k in range(1, 8)]
+        if all(d in by_date.index for d in window):
+            expected = sum(by_date[d] for d in window) / 7
+>           assert feats.set_index("dteday").cnt_roll_7[date] == pytest.approx(expected)
+E           assert np.float64(4389.0) == 4414.857142857143 � 0.00441486
+E             
+E             comparison failed
+E             Obtained: 4389.0
+E             Expected: 4414.857142857143 � 0.00441486
+
+tests\test_leakage.py:57: AssertionError
+=========================== short test summary info ============================
+FAILED tests/test_leakage.py::test_rolling_mean_excludes_today - assert np.fl...
+1 failed, 15 passed in 2.10s
+make: *** [Makefile:16: test] Error 1
+```
+
+The detector is well aimed. `test_rolling_mean_excludes_today` re-derives the
+expected value from the 7 strictly-earlier calendar days and compares, so a
+missing `.shift(1)` shows up as an exact value mismatch (4389.0 against
+4414.86) rather than as a vague correlation shift. Exactly one test fired:
+dropping `.shift(1)` from `cnt_roll_7` leaves the other lag features correct,
+so `test_lags_are_true_calendar_lags` and
+`test_two_day_lag_is_a_true_calendar_lag` stay green. That is the test doing
+its job precisely, not narrowly.
+
+### Fix
+
+Restored `.shift(1)` with a single `Edit` (not `git checkout`, so a working
+hook would have had its chance to go green -- it stayed silent for the same
+undetermined reason). Confirmed green:
+
+```
+python -m pytest tests/ -q
+................                                                         [100%]
+16 passed in 5.72s
+```
+
+`git diff -- src/` is empty and `git status --porcelain` is empty. Nothing
+committed.
+
+**Fix cost:** 3 tool calls from the first fix attempt through the green run,
+inclusive -- 1 `Edit` (restore `.shift(1)`), 1 `make test` (16 passed), 1
+`git diff -- src/` + `git status --porcelain` (verification, issued in the
+same block as the green run). Only the first is a repair; the other two are
+confirmation.
+
+**Diagnostics, not counted as fix cost:** 1 `Bash` call invoking the hook
+script by hand to establish that the script works and the fault tree is red.
+No re-injection was needed this time -- the first capture of every output
+above was complete, so unlike SF-001 there are no bookkeeping re-runs to
+account for.
+
+### Follow-up this exposes
+
+SF-001's follow-up (parse the payload with the venv interpreter; fail loudly
+rather than silently on an unparseable payload) is **done** in `ad632ff` and
+verified working here. What remains is delivery, not logic: the fixed script
+does not run when an `Edit` touches `src/`. Until that is established, this
+repo has a leakage detector that only `make test` -- a command an agent must
+choose to run -- ever reaches, and the hook contributes nothing. The next
+`/seed-fault` run in a fresh session is the cheapest way to test the
+"config written mid-session" hypothesis above.
